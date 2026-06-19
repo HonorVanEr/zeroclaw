@@ -251,8 +251,7 @@ pub async fn promote(config: &Config, agent: Option<&str>) -> Result<()> {
         .await
         .context("dream promote: failed to create scoped memory backend")?;
 
-    let Some(result) =
-        promote_pending(&dir, memory.as_ref(), config.dream_mode.hard_prune).await?
+    let Some(result) = promote_pending(&dir, memory.as_ref(), config.dream_mode.hard_prune).await?
     else {
         // The pending file was removed between the snapshot above and now
         // (e.g. a concurrent promote, or a manual delete). Nothing to apply —

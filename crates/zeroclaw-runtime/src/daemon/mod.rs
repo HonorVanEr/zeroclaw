@@ -1216,7 +1216,12 @@ async fn run_dream_worker(config: Config) -> Result<()> {
         tokio::time::sleep(sleep_duration).await;
 
         // Run each opted-in agent's cycle in turn, isolated: a failure or
-        // timeout for one agent is logged and never aborts the others.
+        // timeout for one agent is logged and never aborts the others. Track
+        // sweep outcomes so component health reflects whether the sweep made
+        // any successful progress (a wholly-failing dream config must not
+        // report the `dream` component as healthy).
+        let mut succeeded = 0usize;
+        let mut failed = 0usize;
         for agent_alias in &agents {
             match tokio::time::timeout(
                 DREAM_AGENT_TIMEOUT,
@@ -1225,6 +1230,7 @@ async fn run_dream_worker(config: Config) -> Result<()> {
             .await
             {
                 Ok(Ok(result)) => {
+                    succeeded += 1;
                     ::zeroclaw_log::record!(
                         INFO,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note),
@@ -1235,6 +1241,7 @@ async fn run_dream_worker(config: Config) -> Result<()> {
                     );
                 }
                 Ok(Err(e)) => {
+                    failed += 1;
                     ::zeroclaw_log::record!(
                         ERROR,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Fail)
@@ -1243,6 +1250,7 @@ async fn run_dream_worker(config: Config) -> Result<()> {
                     );
                 }
                 Err(_) => {
+                    failed += 1;
                     ::zeroclaw_log::record!(
                         WARN,
                         ::zeroclaw_log::Event::new(module_path!(), ::zeroclaw_log::Action::Note)
@@ -1256,9 +1264,25 @@ async fn run_dream_worker(config: Config) -> Result<()> {
             }
         }
 
-        // The sweep as a whole is healthy even if individual agents errored
-        // (those are surfaced per-agent in the logs above).
-        crate::health::mark_component_ok("dream");
+        // Component health reflects real progress: OK if at least one agent
+        // completed (per-agent failures are surfaced in the logs above);
+        // errored if every opted-in agent failed or timed out.
+        record_dream_sweep_health("dream", succeeded, failed);
+    }
+}
+
+/// Record `dream`-component health from a sweep's outcome counts. The
+/// component is healthy only if at least one agent cycle succeeded; a wholly
+/// failing/timing-out sweep marks it errored so `health`/gateway status
+/// reflect the broken config rather than reporting OK forever.
+fn record_dream_sweep_health(component: &str, succeeded: usize, failed: usize) {
+    if succeeded > 0 {
+        crate::health::mark_component_ok(component);
+    } else {
+        crate::health::mark_component_error(
+            component,
+            format!("all {failed} opted-in agent dream cycle(s) failed or timed out"),
+        );
     }
 }
 
@@ -2317,5 +2341,29 @@ mod tests {
             .expect("task should not panic")
             .expect("signal handler should not error");
         assert_eq!(result, DaemonExit::Shutdown);
+    }
+
+    #[test]
+    fn dream_sweep_health_errors_when_all_agents_fail() {
+        // Unique component names so this never collides with the live "dream"
+        // component or with parallel tests touching the shared health registry.
+        record_dream_sweep_health("dream_test_all_fail", 0, 3);
+        record_dream_sweep_health("dream_test_partial", 1, 2);
+
+        let snap = crate::health::snapshot();
+        assert_eq!(
+            snap.components
+                .get("dream_test_all_fail")
+                .map(|c| c.status.as_str()),
+            Some("error"),
+            "a sweep where every opted-in agent failed must mark the component errored, not OK"
+        );
+        assert_eq!(
+            snap.components
+                .get("dream_test_partial")
+                .map(|c| c.status.as_str()),
+            Some("ok"),
+            "a sweep with at least one successful agent cycle is healthy"
+        );
     }
 }
